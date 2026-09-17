@@ -329,6 +329,93 @@ def telegram_push(token, chat_id, title, content):
         log(f"❌ Telegram 推送失败: {e}")
         return False
 
+def html_to_text(raw):
+    """把推送用的 HTML 片段转成纯文本（微信模板消息只接受纯文本）"""
+    import re
+
+    text = raw.replace("<br>", "\n")
+    text = re.sub(r"</(?:h3|div|p|small|span)>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return "\n".join(ln.strip() for ln in text.split("\n") if ln.strip())
+
+
+def wechat_push(cfg_raw, title, content):
+    """微信公众号（测试号）模板消息推送。
+
+    pushplus 自 2024-08-01 起强制付费实名（未实名返回 905），免费版发不出消息，
+    因此改用微信公众平台测试号：免费、无需实名、消息直接进微信。
+    接入方式见 main() 里对 PUSHPLUS_TOKEN 槽位复用的说明。
+
+    cfg_raw 为 JSON 字符串，形如：
+        {"appid":"wx...","secret":"...","openid":"o...","template_id":"..."}
+    模板内容需包含三个占位符：{{title.DATA}} {{summary.DATA}} {{time.DATA}}
+    """
+    if not cfg_raw:
+        return False
+
+    import json as _json
+
+    try:
+        cfg = _json.loads(cfg_raw) if isinstance(cfg_raw, str) else cfg_raw
+    except ValueError as e:
+        log(f"❌ 微信推送失败: WECHAT_PUSH 不是合法 JSON: {e}")
+        return False
+
+    appid = str(cfg.get("appid") or "").strip()
+    secret = str(cfg.get("secret") or "").strip()
+    openid = str(cfg.get("openid") or "").strip()
+    template_id = str(cfg.get("template_id") or "").strip()
+    if not all((appid, secret, openid, template_id)):
+        log("❌ 微信推送失败: WECHAT_PUSH 缺少 appid/secret/openid/template_id")
+        return False
+
+    try:
+        # 1) 取 access_token（有效期 7200s；每天只跑一次，不需要缓存）
+        resp = requests.get(
+            "https://api.weixin.qq.com/cgi-bin/token",
+            params={"grant_type": "client_credential", "appid": appid, "secret": secret},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        tok = resp.json()
+        if not tok.get("access_token"):
+            raise RuntimeError(
+                f"取 access_token 失败: errcode={tok.get('errcode')} {tok.get('errmsg')}"
+            )
+
+        # 2) 发模板消息。单个字段过长会被微信截断，这里主动收口
+        summary = html_to_text(content)
+        if len(summary) > 800:
+            summary = summary[:800] + " …"
+
+        payload = {
+            "touser": openid,
+            "template_id": template_id,
+            "url": "https://glados.cloud/console",
+            "data": {
+                "title": {"value": title[:200]},
+                "summary": {"value": summary},
+                "time": {"value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            },
+        }
+        resp = requests.post(
+            "https://api.weixin.qq.com/cgi-bin/message/template/send",
+            params={"access_token": tok["access_token"]},
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        out = resp.json()
+        if out.get("errcode") != 0:
+            raise RuntimeError(f"errcode={out.get('errcode')} {out.get('errmsg')}")
+        log("✅ 微信推送成功")
+        return True
+    except (requests.RequestException, ValueError, RuntimeError) as e:
+        log(f"❌ 微信推送失败: {e}")
+        return False
+
+
 def main():
     log("🚀 2026 GLaDOS Checkin Starting...")
     cookies = get_cookies()
@@ -403,16 +490,28 @@ def main():
         log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
         return 0
 
-    ptoken = os.environ.get("PUSHPLUS_TOKEN")
+    ptoken = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
+
+    # 微信公众测试号配置复用了 PUSHPLUS_TOKEN 这个环境变量槽位：值以 `{` 开头即视为
+    # JSON（appid/secret/openid/template_id）走 wechat_push，否则仍按 PushPlus 处理。
+    #
+    # 为什么复用而不新增一个 WECHAT_PUSH 变量：workflow 的环境变量列表写在
+    # .github/workflows/checkin.yml 里，改动该文件需要 PAT 具备 workflow scope，
+    # 而且会让本地 fork 与上游产生差异、日后同步上游时要处理冲突。
+    # PushPlus 免费版已因强制付费实名（2024-08-01 起，未实名返回 905）无法发消息，
+    # 这个槽位对本项目而言是空置的，所以拿来承载微信配置。
+    wx_cfg = ptoken if ptoken.startswith("{") else ""
+
     if ptoken or (tg_token and tg_chat_id):
         title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
         content = "".join(results)
         content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
-        
-        if ptoken:
+
+        if wx_cfg:
+            wechat_push(wx_cfg, title, content)
+        elif ptoken:
             pushplus(ptoken, title, content)
         if tg_token and tg_chat_id:
             telegram_push(tg_token, tg_chat_id, title, content)
