@@ -351,16 +351,87 @@ def html_to_text(raw):
     return "\n".join(ln.strip() for ln in text.split("\n") if ln.strip())
 
 
-def wechat_push(cfg_raw, title, content):
+def _clip(s, n=20):
+    """微信模板消息单个字段约 20 字就截断加省略号，这里主动收口，避免出现半截话"""
+    s = str(s).strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def build_wechat_fields(accounts):
+    """把账号结果压成微信模板需要的短字段。
+
+    微信模板消息卡片有硬性限制（2023-05-04 起，实测确认）：
+      · 首行与尾行一律被丢弃（跟字段叫什么名字无关，看位置）
+      · 单个字段约 20 字就截断加省略号
+      · 不支持换行、emoji 会被剔除、自定义颜色被去掉
+    所以配套模板必须写成「首尾放牺牲行、真信息夹在中间」：
+
+        {{pad1.DATA}}
+        签到：{{r.DATA}}
+        积分：{{p.DATA}}
+        天数：{{d.DATA}}
+        兑换：{{e.DATA}}
+        {{pad2.DATA}}
+
+    首尾两行会被微信丢掉，中间 4 行才会显示出来。
+    """
+    total = len(accounts)
+    ok_cnt = sum(1 for a in accounts if a.get("ok"))
+    a = accounts[0] if accounts else {}
+
+    if ok_cnt == total:
+        result = "成功" if total == 1 else "全部成功 %d/%d" % (ok_cnt, total)
+    else:
+        result = "失败 %d/%d" % (total - ok_cnt, total)
+
+    points = str(a.get("points", "?"))
+    change = str(a.get("points_change") or "").strip()
+    if change and change not in ("+0", "-0", "0"):
+        points = "%s (%s)" % (points, change)
+
+    exchange = str(a.get("exchange") or "未达门槛")
+    for icon in ("⏭️ ", "✅ ", "⚠️ ", "❌ ", "🎁 "):
+        exchange = exchange.replace(icon, "")
+    # auto_exchange 的原始文案偏长（会超过微信的 20 字上限被截断），这里压成短句
+    import re as _re
+
+    m = _re.search(r"积分不足\((\d+)/(\d+)\)", exchange)
+    if m:
+        exchange = "差 %d 分" % (int(m.group(2)) - int(m.group(1)))
+    elif "兑换成功" in exchange:
+        m2 = _re.search(r"\+(\d+)\s*天", exchange)
+        exchange = "已兑 +%s天" % (m2.group(1) if m2 else "?")
+    elif "兑换失败" in exchange:
+        exchange = "兑换失败"
+    elif "跳过" in exchange:
+        exchange = "兑换跳过"
+
+    return {
+        "pad1": "GLaDOS 自动签到",            # 牺牲行，会被微信丢弃
+        "r": result,
+        "p": points,
+        "d": "%s 天" % a.get("days", "?"),
+        "e": exchange,
+        "pad2": "GitHub Actions 定时任务",     # 牺牲行，会被微信丢弃
+    }
+
+
+def wechat_push(cfg_raw, fields):
     """微信公众号（测试号）模板消息推送。
 
     pushplus 自 2024-08-01 起强制付费实名（未实名返回 905），免费版发不出消息，
     因此改用微信公众平台测试号：免费、无需实名、消息直接进微信。
     接入方式见 main() 里对 PUSHPLUS_TOKEN 槽位复用的说明。
 
-    cfg_raw 为 JSON 字符串，形如：
+    cfg_raw 为 JSON 字符串：
         {"appid":"wx...","secret":"...","openid":"o...","template_id":"..."}
-    模板内容需包含三个占位符：{{title.DATA}} {{summary.DATA}} {{time.DATA}}
+
+    两个实测踩出来的坑：
+      · **不要传 url**。传了卡片底部会出现可点击的「详情」，点一下直接跳外链，
+        反而把内容挡住 —— 实测确认。
+      · 字段值必须短（约 20 字），长内容会被截断成「…」。
+
+    fields 由 build_wechat_fields() 生成，键名要与模板占位符一一对应。
     """
     if not cfg_raw:
         return False
@@ -370,7 +441,7 @@ def wechat_push(cfg_raw, title, content):
     try:
         cfg = _json.loads(cfg_raw) if isinstance(cfg_raw, str) else cfg_raw
     except ValueError as e:
-        log(f"❌ 微信推送失败: WECHAT_PUSH 不是合法 JSON: {e}")
+        log(f"❌ 微信推送失败: 配置不是合法 JSON: {e}")
         return False
 
     appid = str(cfg.get("appid") or "").strip()
@@ -378,7 +449,11 @@ def wechat_push(cfg_raw, title, content):
     openid = str(cfg.get("openid") or "").strip()
     template_id = str(cfg.get("template_id") or "").strip()
     if not all((appid, secret, openid, template_id)):
-        log("❌ 微信推送失败: WECHAT_PUSH 缺少 appid/secret/openid/template_id")
+        log("❌ 微信推送失败: 配置缺少 appid/secret/openid/template_id")
+        return False
+
+    if not fields:
+        log("❌ 微信推送失败: 没有生成模板字段")
         return False
 
     try:
@@ -395,20 +470,10 @@ def wechat_push(cfg_raw, title, content):
                 f"取 access_token 失败: errcode={tok.get('errcode')} {tok.get('errmsg')}"
             )
 
-        # 2) 发模板消息。单个字段过长会被微信截断，这里主动收口
-        summary = html_to_text(content)
-        if len(summary) > 800:
-            summary = summary[:800] + " …"
-
         payload = {
             "touser": openid,
             "template_id": template_id,
-            "url": "https://glados.cloud/console",
-            "data": {
-                "title": {"value": title[:200]},
-                "summary": {"value": summary},
-                "time": {"value": now_cn().strftime("%Y-%m-%d %H:%M:%S")},
-            },
+            "data": {k: {"value": _clip(v)} for k, v in fields.items()},
         }
         resp = requests.post(
             "https://api.weixin.qq.com/cgi-bin/message/template/send",
@@ -426,7 +491,6 @@ def wechat_push(cfg_raw, title, content):
         log(f"❌ 微信推送失败: {e}")
         return False
 
-
 def main():
     log("🚀 2026 GLaDOS Checkin Starting...")
     cookies = get_cookies()
@@ -441,6 +505,7 @@ def main():
         log("⏭️ 自动兑换未启用")
 
     results = []
+    accounts = []          # 结构化结果，给微信这种有长度限制的渠道用
     success_cnt = 0
     exchange_events = 0
 
@@ -472,6 +537,14 @@ def main():
 
         if is_success:
             success_cnt += 1
+
+        accounts.append({
+            "ok": is_success,
+            "points": g.points,
+            "points_change": g.points_change,
+            "days": g.left_days,
+            "exchange": g.exchange_result if exchange_plan else "",
+        })
 
         # 4. Result Formatting
         exchange_line = ""
@@ -521,7 +594,9 @@ def main():
         content += f"<br><small>时间: {now_cn().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</small>"
 
         if wx_cfg:
-            wechat_push(wx_cfg, title, content)
+            # 微信模板消息装不下完整报告（首尾行被丢、单字段约 20 字），
+            # 所以单独生成一组短字段，见 build_wechat_fields()
+            wechat_push(wx_cfg, build_wechat_fields(accounts))
         elif ptoken:
             pushplus(ptoken, title, content)
         if tg_token and tg_chat_id:
