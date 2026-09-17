@@ -17,7 +17,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -58,6 +58,17 @@ EXCHANGE_PLANS = {
 EXCHANGE_DISABLED_VALUES = ("", "off", "no", "none", "false", "0", "disabled")
 
 # ================= 工具函数 =================
+
+# 推送内容里的时间统一显示北京时间。
+# GitHub Actions 的运行环境是 UTC，直接用 datetime.now() 会让北京时间 09:30 的
+# 签到推送显示成 01:30，容易被误读成「签到时间不对」。
+CST = timezone(timedelta(hours=8))
+
+
+def now_cn():
+    """当前北京时间（带时区）"""
+    return datetime.now(CST)
+
 
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -396,7 +407,7 @@ def wechat_push(cfg_raw, title, content):
             "data": {
                 "title": {"value": title[:200]},
                 "summary": {"value": summary},
-                "time": {"value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                "time": {"value": now_cn().strftime("%Y-%m-%d %H:%M:%S")},
             },
         }
         resp = requests.post(
@@ -507,7 +518,7 @@ def main():
     if ptoken or (tg_token and tg_chat_id):
         title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
         content = "".join(results)
-        content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
+        content += f"<br><small>时间: {now_cn().strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</small>"
 
         if wx_cfg:
             wechat_push(wx_cfg, title, content)
